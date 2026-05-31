@@ -2,234 +2,81 @@ name: Build iOS IPA (Sideload)
 
 on:
   workflow_dispatch:
-    inputs:
-      branch:
-        description: "Branch to build from"
-        required: true
-        default: "cmp-rewrite"
 
 jobs:
   build-ios:
-    name: Build unsigned IPA
-    runs-on: macos-15
+    name: Build iOS IPA
+    runs-on: macos-latest
 
     steps:
-      # ── 1. Checkout (no submodules yet) ──────────────────────────────────────
-      - name: Checkout repository
+      - name: Checkout Repository & Submodules
         uses: actions/checkout@v4
+
+      - name: Fetch iOS Specific Submodule
+        run: git submodule update --init --recursive MPVKit
+
+      - name: Select Latest Stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
         with:
-          ref: ${{ github.event.inputs.branch }}
-          submodules: false
+          xcode-version: latest-stable
 
-      # ── 1b. Init only valid submodules ───────────────────────────────────────
-      # libass-android and stremio-community-v5 have no remote URL in .gitmodules
-      # so recursive init crashes. Python rewrites .gitmodules first, keeping
-      # only entries that have a url = line, then we init those (MPVKit).
-      - name: Init valid submodules only
-        run: |
-          python3 << 'PYEOF'
-          import configparser, pathlib, sys
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
-          p = pathlib.Path(".gitmodules")
-          if not p.exists():
-              print("No .gitmodules, skipping")
-              sys.exit(0)
-
-          raw = p.read_text()
-          print("=== .gitmodules BEFORE ===")
-          print(raw)
-
-          cfg = configparser.RawConfigParser()
-          cfg.read_string(raw)
-
-          to_remove = [s for s in cfg.sections()
-                       if not cfg.get(s, "url", fallback="").strip()]
-          for s in to_remove:
-              print(f"Removing no-URL submodule: {s}")
-              cfg.remove_section(s)
-
-          with open(p, "w") as f:
-              cfg.write(f)
-
-          print("=== .gitmodules AFTER ===")
-          print(p.read_text())
-          PYEOF
-
-          git submodule sync
-          git submodule update --init --recursive --depth=1
-
-      # ── 2. Diagnose the project structure ────────────────────────────────────
-      # Prints key files so we can verify names/paths before using them.
-      - name: Diagnose project layout
-        run: |
-          echo "=== Top-level ==="
-          ls -1
-
-          echo ""
-          echo "=== iosApp contents ==="
-          ls -1 iosApp/
-
-          echo ""
-          echo "=== Xcode schemes ==="
-          # List schemes from the xcworkspace if it exists, else xcodeproj
-          if [ -d "iosApp/iosApp.xcworkspace" ]; then
-            xcodebuild -workspace iosApp/iosApp.xcworkspace -list 2>&1 || true
-          elif [ -d "iosApp/iosApp.xcodeproj" ]; then
-            xcodebuild -project iosApp/iosApp.xcodeproj -list 2>&1 || true
-          else
-            echo "WARNING: No xcworkspace or xcodeproj found in iosApp/"
-            find iosApp -name "*.xcworkspace" -o -name "*.xcodeproj" 2>/dev/null
-          fi
-
-          echo ""
-          echo "=== Gradle iOS tasks ==="
-          ./gradlew :composeApp:tasks --all 2>/dev/null | grep -iE "ios|xcframework|framework" | head -40 || true
-
-          echo ""
-          echo "=== local.properties ==="
-          cat local.properties 2>/dev/null || echo "(not present)"
-
-      # ── 3. Java (required by Gradle / KMP) ──────────────────────────────────
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: "17"
+          java-version: '17'
+          distribution: 'temurin'
 
-      # ── 4. Write local.properties ────────────────────────────────────────────
-      # Kotlin/Native Xcode build scripts read JAVA_HOME from local.properties.
-      # Without it, Xcode's Run Script phase fails with "java not found".
-      - name: Write local.properties
+      # Add these secrets in your fork under:
+      # Settings → Secrets and variables → Actions → New repository secret
+      # The build will work without them but features like Trakt/TMDB won't function.
+      - name: Generate local.properties
         run: |
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
-          echo "org.gradle.java.home=$JAVA_HOME" >> local.properties
-          echo "Written local.properties:"
-          cat local.properties
+          cat << 'EOF' > local.properties
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+          TRAKT_CLIENT_ID=${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_CLIENT_SECRET=${{ secrets.TRAKT_CLIENT_SECRET }}
+          TRAKT_REDIRECT_URI=${{ secrets.TRAKT_REDIRECT_URI }}
+          TMDB_API_KEY=${{ secrets.TMDB_API_KEY }}
+          INTRODB_API_URL=${{ secrets.INTRODB_API_URL }}
+          CONTRIBUTIONS_URL=${{ secrets.CONTRIBUTIONS_URL }}
+          DONATIONS_BASE_URL=${{ secrets.DONATIONS_BASE_URL }}
+          DONATIONS_DONATE_URL=${{ secrets.DONATIONS_DONATE_URL }}
+          DIRECT_DEBRID_API_BASE_URL=${{ secrets.DIRECT_DEBRID_API_BASE_URL }}
+          NUVIO_IOS_DISTRIBUTION=full
+          EOF
 
-      # ── 5. Gradle cache ──────────────────────────────────────────────────────
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('**/*.gradle.kts', '**/gradle-wrapper.properties') }}
-          restore-keys: gradle-
-
-      # ── 6. CocoaPods cache ──────────────────────────────────────────────────
-      - name: Cache CocoaPods
-        uses: actions/cache@v4
-        with:
-          path: iosApp/Pods
-          key: pods-${{ hashFiles('iosApp/Podfile.lock') }}
-          restore-keys: pods-
-
-      # ── 7. Build shared Kotlin/iOS framework ─────────────────────────────────
-      # assembleReleaseXCFramework is the standard KMP task name.
-      # We fall back to the plain assembleXCFramework if the release variant
-      # doesn't exist (task names vary slightly by KMP version).
-      - name: Build Kotlin shared framework
+      - name: Build iOS App via Xcode
         run: |
-          if ./gradlew :composeApp:tasks --all 2>/dev/null | grep -q "assembleReleaseXCFramework"; then
-            echo "Using assembleReleaseXCFramework"
-            ./gradlew :composeApp:assembleReleaseXCFramework \
-              -Pkotlin.native.cacheKind=none --stacktrace
-          elif ./gradlew :composeApp:tasks --all 2>/dev/null | grep -q "assembleXCFramework"; then
-            echo "Using assembleXCFramework"
-            ./gradlew :composeApp:assembleXCFramework \
-              -Pkotlin.native.cacheKind=none --stacktrace
-          else
-            echo "Falling back to linkReleaseFrameworkIosArm64"
-            ./gradlew :composeApp:linkReleaseFrameworkIosArm64 \
-              -Pkotlin.native.cacheKind=none --stacktrace
-          fi
-
-          echo ""
-          echo "=== Built framework/xcframework locations ==="
-          find composeApp/build -name "*.xcframework" -o -name "*.framework" 2>/dev/null | head -20
-
-      # ── 8. Install CocoaPods ─────────────────────────────────────────────────
-      # Uses the system Ruby on macos-15 (Ruby 3.x). Forces the correct gem
-      # dir so we don't conflict with system gems.
-      - name: Install CocoaPods
-        run: |
-          sudo gem install cocoapods --no-document
           cd iosApp
-          pod install --repo-update
-          echo ""
-          echo "=== Pod install complete. Workspace ==="
-          ls -1
-
-      # ── 9. Build & archive (unsigned) ────────────────────────────────────────
-      # We list available schemes first so the log shows exactly what Xcode sees,
-      # making it easy to spot a wrong scheme name.
-      - name: Build Xcode archive
-        run: |
-          # Determine workspace/project and scheme
-          if [ -f "iosApp/iosApp.xcworkspace/contents.xcworkspacedata" ]; then
-            BUILD_CMD="-workspace iosApp/iosApp.xcworkspace"
-          else
-            BUILD_CMD="-project iosApp/iosApp.xcodeproj"
-          fi
-
-          # Auto-detect scheme (prefer non-Pods scheme)
-          SCHEME=$(xcodebuild $BUILD_CMD -list 2>/dev/null \
-            | awk '/Schemes:/,0' \
-            | grep -v "Schemes:" \
-            | grep -v "Pods" \
-            | head -1 \
-            | xargs)
-          echo "Detected scheme: '$SCHEME'"
-          [ -z "$SCHEME" ] && SCHEME="iosApp"
-
-          set -o pipefail
-          xcodebuild archive \
-            $BUILD_CMD \
-            -scheme "$SCHEME" \
+          xcodebuild \
+            -project iosApp.xcodeproj \
+            -scheme iosApp \
             -configuration Release \
+            -sdk iphoneos \
             -destination "generic/platform=iOS" \
-            -archivePath "$RUNNER_TEMP/NuvioMobile.xcarchive" \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
+            -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
-            DEVELOPMENT_TEAM="" \
-            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
 
-      # ── 10. Package IPA ───────────────────────────────────────────────────────
-      - name: Package IPA from archive
+      - name: Package App into .ipa
         run: |
-          APP_PATH=$(find "$RUNNER_TEMP/NuvioMobile.xcarchive/Products/Applications" \
-            -maxdepth 1 -name "*.app" | head -1)
-          if [ -z "$APP_PATH" ]; then
-            echo "ERROR: No .app found in archive. Archive contents:"
-            find "$RUNNER_TEMP/NuvioMobile.xcarchive" -maxdepth 4
-            exit 1
-          fi
-          echo "Found app: $APP_PATH"
+          cd iosApp/build/Build/Products/Release-iphoneos
+          APP_VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Nuvio.app/Info.plist)
+          mkdir Payload
+          mv Nuvio.app Payload/
+          zip -q -r "Nuvio-v${APP_VERSION}.ipa" Payload
+          echo "IPA_FILENAME=Nuvio-v${APP_VERSION}.ipa" >> $GITHUB_ENV
 
-          mkdir -p "$RUNNER_TEMP/Payload"
-          cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
-
-          cd "$RUNNER_TEMP"
-          zip -r NuvioMobile.ipa Payload/
-          echo "IPA size: $(du -sh NuvioMobile.ipa | cut -f1)"
-
-      # ── 11. Upload IPA ────────────────────────────────────────────────────────
-      - name: Upload IPA
+      - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NuvioMobile-iOS-${{ github.run_number }}
-          path: ${{ runner.temp }}/NuvioMobile.ipa
+          name: Nuvio-iOS-${{ github.run_number }}
+          path: iosApp/build/Build/Products/Release-iphoneos/${{ env.IPA_FILENAME }}
           retention-days: 30
           if-no-files-found: error
-
-      # ── 12. Upload build log + archive on failure ─────────────────────────────
-      - name: Upload debug artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: NuvioMobile-debug-${{ github.run_number }}
-          path: |
-            ${{ runner.temp }}/xcodebuild.log
-            ${{ runner.temp }}/NuvioMobile.xcarchive
-          retention-days: 7
