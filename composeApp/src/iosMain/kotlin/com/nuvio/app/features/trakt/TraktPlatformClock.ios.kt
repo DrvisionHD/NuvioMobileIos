@@ -2,7 +2,9 @@ package com.nuvio.app.features.trakt
 
 import platform.Foundation.NSDate
 import platform.Foundation.timeIntervalSince1970
+import kotlin.experimental.ExperimentalNativeApi // Add this import
 
+@OptIn(ExperimentalNativeApi::class) // Add this annotation
 internal actual object TraktPlatformClock {
     actual fun nowEpochMs(): Long = (NSDate().timeIntervalSince1970 * 1000.0).toLong()
 
