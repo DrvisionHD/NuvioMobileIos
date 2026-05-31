@@ -1,14 +1,14 @@
 name: Build iOS Sideloadable IPA
 
 on:
-  workflow_dispatch: # Allows you to manually trigger the build from the Actions tab
+  workflow_dispatch: # Allows manual trigger from the Actions tab
   push:
     branches: [ "main", "master", "cmp-rewrite" ]
 
 jobs:
   build-ios:
-    runs-on: macos-14 # macOS runner equipped with Xcode 15+
-
+    runs-on: macos-15 # Updated to macos-15 to use Xcode 16+ by default
+    
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
